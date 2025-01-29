@@ -1,0 +1,312 @@
+#!/usr/bin/env python3
+import os
+import sys
+import pickle
+import time
+import cv2
+import onnx
+import numpy as np
+import yaml
+from pathlib import Path
+from onnx.helper import tensor_dtype_to_np_dtype
+
+# Agregar directorio de 'extra'
+sys.path.append(str(Path(__file__).resolve().parent.parent))
+
+# Importar módulos de 'extra' y 'tinygrad'
+from extra.onnx import OnnxRunner
+from tinygrad import Device, TinyJit, Context, GlobalCounters
+from tinygrad.tensor import Tensor
+from tinygrad.helpers import DEBUG, getenv
+from tinygrad.engine.realize import CompiledRunner
+
+# Mostrar dispositivos disponibles
+print(list(Device.get_available_devices()))
+
+# Establecer variables de entorno si no están definidas
+os.environ.setdefault("JIT", "2")
+os.environ.setdefault("IMAGE", "1")
+os.environ.setdefault("FLOAT16", "1")
+os.environ.setdefault("DEFAULT_FLOAT", "HALF")
+
+# os.environ.setdefault("CUDA", "1")
+# os.environ.setdefault("DEBUG", "4")
+# os.environ.setdefault("NOLOCALS", "1") # REDUCE OPTIMIZACION
+# os.environ.setdefault("PTX", "1")
+# os.environ.setdefault("PROFILE", "1")
+# os.environ.setdefault("JIT_BATCH_SIZE", "0")
+
+# Directorio de imágenes y lista de imágenes
+dir_images_path = Path("/home/manuelo247/models/ground-Truth/images/")
+images_sample = sorted([img for ext in ["*.jpg", "*.jpeg", "*.png"] for img in dir_images_path.glob(ext)])
+image_path = dir_images_path / Path("Avances-Elite-Toluquilla-II-a-julio-2024_mp4-0021.jpg") # Imagen especifica
+
+# Ruta para los modelos
+base_path = Path("/home/manuelo247/models/boxes/yoloV8-Medium-NucleaV9/")
+model_path_pt = base_path / Path("best.pt") 
+model_path_onnx = base_path / Path("best.onnx") 
+model_path_pkl = base_path / Path("best.pkl")
+
+# Cargar clases desde el archivo YAML
+yaml_path = Path("/home/manuelo247/models/ground-Truth/data.yaml")
+with yaml_path.open("r") as f:
+    data = yaml.safe_load(f)
+CLASSES = data.get("names", [])
+np.random.seed(42)
+colors = np.random.uniform(0, 255, size=(len(CLASSES), 3)) # Generar colores para cada clase
+
+debug = False
+
+class Timer:
+    def __init__(self):
+        self.start_time = None
+    
+    def start(self):
+        """Inicia el timer."""
+        self.start_time = time.time()
+    
+    def stop(self):
+        """Detiene el timer y devuelve el tiempo transcurrido en segundos."""
+        if self.start_time is None:
+            raise ValueError("El timer no ha sido iniciado. Usa start() primero.")
+        return int(round(((time.time() - self.start_time) * 1000)))
+
+def draw_bounding_box(img, class_id, confidence, x, y, x_plus_w, y_plus_h):
+      label = f'{CLASSES[class_id]} ({confidence:.2f})'
+      color = colors[class_id]
+      cv2.rectangle(img, (x, y), (x_plus_w, y_plus_h), color, 2)
+      cv2.putText(img, label, (x - 10, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+
+def preprocess_image(image, target_size=(640, 480)):
+  """
+    Preprocesa la imagen para que sea compatible con el modelo. Realiza:
+    1. Redimensionamiento de la imagen.
+    2. Normalización de valores de píxeles.
+    3. Cambio de formato de HWC a CHW.
+    4. Añadido de dimensión de lote.
+    5. Diccionario creado con las entradas procesadas
+    
+    Args:
+        image (np.ndarray): Imagen de entrada en formato HWC.
+        target_size (tuple): Tamaño al que redimensionar la imagen (alto, ancho).
+        
+    Returns:
+        dict: Diccionario con las entradas procesadas para el modelo.
+  """
+  resized_image = cv2.resize(image, target_size)
+  normalized_image = resized_image.astype(np.float32) / 255.0
+  chw_image = np.transpose(normalized_image, (2, 0, 1))  # De HWC a CHW
+  batched_image = np.expand_dims(chw_image, axis=0)  # Añadir dimensión de lote
+  
+  new_inputs_numpy = {"images": batched_image}
+  
+  for k, v in new_inputs_numpy.items():
+    print(f"{k}: {v.shape}") if debug else None
+  
+  # Crear las entradas que el modelo espera, y asegurarse de que las claves coincidan con los nombres en el modelo
+  inputs = {k: Tensor(v, device="NPY").realize() for k, v in new_inputs_numpy.items()}
+
+  return inputs
+
+def postprocess_image(output_tensor, original_image):
+  timer = Timer()
+  timer.start()
+  
+  # Extraer caracteristicas de imagen
+  height, width, _ = original_image.shape
+  length = max(height, width)
+  scale = length / 640
+  
+  #
+  score_threshold = 0.45
+  
+  # Redimensionar la imagen a 640x480 para procesamiento
+  resized_image = cv2.resize(original_image, (640, 480))
+  fase1_timer = timer.stop()
+  
+  timer.start()
+  output_tensor = output_tensor.numpy()
+  # print(f"One value tensor: {output_tensor[0, 0, 0]}")
+  # output_tensor[0, 0, 0].realize()
+  # print(f"One value tensor: {output_tensor[0, 0, 0].item()}")
+  fase2_timer = timer.stop()
+  print("output_tensor:", output_tensor) if debug else None
+  
+  timer.start()
+  # Procesar tensor de salida y extraer caracteristicas
+  batch_size, num_classes_plus_5, num_boxes = output_tensor.shape # Extraer las dimensiones del tensor
+  output_tensor = np.transpose(output_tensor, (0, 2, 1)) # Transponer el tensor
+  rows = output_tensor.shape[1] # Extraes columbas del tensor
+  if debug:
+    print("batch_size", batch_size, "num_classes_plus_5", num_classes_plus_5, "num_boxes", num_boxes) 
+    print("Forma transpuesta:", output_tensor.shape) 
+    print("outputs: ", output_tensor) 
+    print("rows: ", rows) 
+  
+  boxes, scores, class_ids = [], [], []
+  for i in range(rows):
+      classes_scores = output_tensor[0][i][4:]
+      (minScore, maxScore, minClassLoc, (x, maxClassIndex)) = cv2.minMaxLoc(classes_scores)
+      if maxScore >= score_threshold:
+          box = [
+                output_tensor[0][i][0] - 0.5 * output_tensor[0][i][2],  # x1
+                output_tensor[0][i][1] - 0.5 * output_tensor[0][i][3],  # y1
+                output_tensor[0][i][2],  # w
+                output_tensor[0][i][3]   # h
+          ]
+          boxes.append(box)
+          scores.append(maxScore)
+          class_ids.append(maxClassIndex)
+
+  # Aplicar Non-Maximum Suppression  
+  nms_boxes = cv2.dnn.NMSBoxes(boxes, scores, score_threshold, 0.45, 0.5)
+  
+  detections = []
+  for i in range(len(nms_boxes)):
+      index = nms_boxes[i]
+      box = boxes[index]
+      detection = {
+          'class_id': class_ids[index],
+          'class_name': CLASSES[class_ids[index]],
+          'confidence': scores[index],
+          'box': box,
+          'scale': scale
+      }
+      detections.append(detection)
+      
+       # Dibujar las cajas en la imagen redimensionada
+      x, y, x_plus_w, y_plus_h = round(box[0] * scale), round(box[1] * scale), round((box[0] + box[2]) * scale), round((box[1] + box[3]) * scale)
+      draw_bounding_box(resized_image, class_ids[index], scores[index], x, y, x_plus_w, y_plus_h)
+      
+  
+  # resized_image = cv2.resize(resized_image, (height, width))
+  fase3_timer = timer.stop()
+  print("Post-Inferencia: fase 1:", str(fase1_timer) + "ms,", "fase 2:", str(fase2_timer) + "ms,", "fase 3:", str(fase3_timer) + "ms")
+  
+  return resized_image
+    
+def compilar_modelo():
+  onnx_model = onnx.load(open(model_path_onnx, "rb"))
+  input_shapes = {inp.name:tuple(x.dim_value for x in inp.type.tensor_type.shape.dim) for inp in onnx_model.graph.input}
+  print("Input shapes:", input_shapes) if debug else None
+  
+  run_onnx = OnnxRunner(onnx_model)
+  run_onnx_jit = TinyJit(
+    lambda **kwargs:
+      next(iter(run_onnx({k:v.to(Device.DEFAULT) for k,v in kwargs.items()}).values())).cast('float32'), 
+      prune=True
+  )
+
+  input_shapes = {inp.name: tuple(x.dim_value for x in inp.type.tensor_type.shape.dim) for inp in onnx_model.graph.input}
+  input_types = {inp.name: tensor_dtype_to_np_dtype(inp.type.tensor_type.elem_type) for inp in onnx_model.graph.input}
+  input_types = {k:(np.float32 if v==np.float16 else v) for k,v in input_types.items()}
+  print("input shapes: ", input_shapes)
+  print("input types: ", input_types)
+  
+  for i in range(3):
+        GlobalCounters.reset()
+        print(f"run {i}")
+        image = cv2.imread(images_sample[i])
+        if image is None:
+            raise ValueError("No se pudo cargar la imagen.")
+        model_input = preprocess_image(image, target_size=(640, 480))
+
+        print(model_input)
+        # Ejecutar el modelo con las entradas
+        with Context(DEBUG=max(DEBUG.value, 2 if i == 2 else 1)):
+            ret = run_onnx_jit(**model_input).numpy()
+        
+        # Copiar para la validación posterior
+        if i == 1:
+            test_val = np.copy(ret)
+
+  print(f"captured {len(run_onnx_jit.captured.jit_cache)} kernels")
+  try:
+      np.testing.assert_allclose(test_val, ret, rtol=1e-3, atol=1e-3, err_msg="JIT run failed")
+      print("jit run validated")
+  except AssertionError as e:
+      print("Validation failed with differences:")
+      print(e)
+      
+  # checks from compile2
+  kernel_count = 0
+  read_image_count = 0
+  gated_read_image_count = 0
+  for ei in run_onnx_jit.captured.jit_cache:
+    if isinstance(ei.prg, CompiledRunner):
+      kernel_count += 1
+      read_image_count += ei.prg.p.src.count("read_image")
+      gated_read_image_count += ei.prg.p.src.count("?read_image")
+  print(f"{kernel_count=},  {read_image_count=}, {gated_read_image_count=}")
+  if (allowed_kernel_count:=getenv("ALLOWED_KERNEL_COUNT", -1)) != -1:
+    assert kernel_count <= allowed_kernel_count, f"too many kernels! {kernel_count=}, {allowed_kernel_count=}"
+  if (allowed_read_image:=getenv("ALLOWED_READ_IMAGE", -1)) != -1:
+    assert read_image_count == allowed_read_image, f"different read_image! {read_image_count=}, {allowed_read_image=}"
+  if (allowed_gated_read_image:=getenv("ALLOWED_GATED_READ_IMAGE", -1)) != -1:
+    assert gated_read_image_count <= allowed_gated_read_image, f"too many gated read_image! {gated_read_image_count=}, {allowed_gated_read_image=}"
+
+  OUTPUT = "/home/manuelo247/models/boxes/yoloV8-Medium-NucleaV9/best.pkl"
+  with open(OUTPUT, "wb") as f:
+    pickle.dump(run_onnx_jit, f)
+  mdl_sz = os.path.getsize(model_path_onnx)
+  pkl_sz = os.path.getsize(OUTPUT)
+  print(f"mdl size is {mdl_sz/1e6:.2f}M")
+  print(f"pkl size is {pkl_sz/1e6:.2f}M")
+  print("**** compile done ****")
+  
+  return run_onnx_jit
+
+print("Classes: ", CLASSES) if debug else None
+
+os.chdir("/tmp")
+if not Path(model_path_onnx).is_file():
+  raise FileNotFoundError(f"El modelo ONNX no existe en: {model_path_onnx}")
+
+if not Path(model_path_pkl).is_file():
+  print(f"El archivo '{model_path_pkl}' no existe.")
+  print(f"Compilando...")
+  run_onnx_jit = compilar_modelo()
+else: 
+    print(f"Abriendo modelo compilado en {model_path_pkl}")
+    with open(model_path_pkl, "rb") as f:
+        run_onnx_jit = pickle.load(f)
+  
+print(run_onnx_jit) if debug else None
+
+# images_sample = ["Avances-Elite-Toluquilla-II-a-julio-2024_mp4-0021.jpg"]
+timer = Timer()
+for image_path in images_sample:
+  timer.start()
+  original_image = cv2.imread(image_path)
+  if original_image is None:
+      raise FileNotFoundError("No se pudo cargar la imagen.")
+    
+  # Pre-procesar la imagen a inputs que espera en modelo tinyjit
+  model_input = preprocess_image(original_image, target_size=(640, 480))
+  preinferencia_time = timer.stop()
+  
+  # Ejecutar la inferencia
+  timer.start()
+  output_tensor = run_onnx_jit(**model_input)  
+  inferencia_time = timer.stop()
+  
+  print("Raw tensor: ", output_tensor) if debug else None
+  
+  # Post-procesar la imagen con las detecciones
+  timer.start()
+  postprocessed_image = postprocess_image(output_tensor, original_image)
+  postinferencia_time = timer.stop()
+  
+  # Imprimir velocidad del modelo
+  print(f"Pre-inferencia: {preinferencia_time}ms, Inferencia: {inferencia_time}ms, Post-inferencia: {postinferencia_time}ms")
+  
+  # Mostrar la imagen con las detecciones
+  cv2.imshow("Tinygrad model", postprocessed_image)
+  if cv2.waitKey(1) & 0xFF == ord('q'):
+      break
+cv2.destroyAllWindows()
+
+# # Guardar o mostrar la imagen con las detecciones
+# output_path = "output_image.jpg"
+# cv2.imwrite(output_path, output_image)
+# print(f"Imagen procesada guardada en: {output_path}")
