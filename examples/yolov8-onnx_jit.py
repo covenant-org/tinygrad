@@ -9,7 +9,11 @@ import numpy as np
 import yaml
 import requests
 from pathlib import Path
+import zipfile
+import shutil
 from onnx.helper import tensor_dtype_to_np_dtype
+
+
 
 # Agregar directorio de 'extra'
 sys.path.append(str(Path(__file__).resolve().parent.parent))
@@ -37,24 +41,9 @@ os.environ.setdefault("DEFAULT_FLOAT", "HALF")
 # os.environ.setdefault("PROFILE", "1")
 # os.environ.setdefault("JIT_BATCH_SIZE", "0")
 
-# Directorio de imágenes y lista de imágenes
-dir_images_path = Path("/home/manuelo247/models/ground-Truth/images/")
-images_sample = sorted([img for ext in ["*.jpg", "*.jpeg", "*.png"] for img in dir_images_path.glob(ext)])
-image_path = dir_images_path / Path("Avances-Elite-Toluquilla-II-a-julio-2024_mp4-0021.jpg") # Imagen especifica
-yaml_path = Path("/home/manuelo247/models/ground-Truth/data.yaml")
-
 # Ruta para los modelos
 url_model = "https://github.com/covenant-org/tinygrad/releases/download/yoloV8-Medium-NucleaV9/best.onnx" # URL de descarga
-base_path = Path(__file__).resolve().parent.parent / Path("models")
-model_path_onnx = base_path / Path("best.onnx") 
-model_path_pkl = base_path / Path("best.pkl")
-
-# Cargar clases desde el archivo YAML
-with yaml_path.open("r") as f:
-    data = yaml.safe_load(f)
-CLASSES = data.get("names", [])
-np.random.seed(42)
-colors = np.random.uniform(0, 255, size=(len(CLASSES), 3)) # Generar colores para cada clase
+url_dataset = "https://app.roboflow.com/ds/qnXOxt8VKv?key=1mmF2G81LD"
 
 debug = False
 
@@ -75,10 +64,93 @@ class Timer:
 
 
 def draw_bounding_box(img, class_id, confidence, x, y, x_plus_w, y_plus_h):
-      label = f'{CLASSES[class_id]} ({confidence:.2f})'
-      color = colors[class_id]
-      cv2.rectangle(img, (x, y), (x_plus_w, y_plus_h), color, 2)
-      cv2.putText(img, label, (x - 10, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+  label = f'{CLASSES[class_id]} ({confidence:.2f})'
+  color = colors[class_id]
+  cv2.rectangle(img, (x, y), (x_plus_w, y_plus_h), color, 2)
+  cv2.putText(img, label, (x - 10, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+
+def process_dataset():
+  zip_path = base_path / Path("dataset.zip" )
+  gt_path = base_path / Path("ground-truth")
+
+  if not zip_path.exists():
+    print(f"No existe {zip_path}")
+    print("Descargando...")
+    response = requests.get(url_dataset, allow_redirects=True)
+    with open(zip_path, "wb") as file:
+        file.write(response.content)
+    print("Descargado en {zip_path}")
+      
+  with zipfile.ZipFile(zip_path, "r") as zip_ref:
+      zip_ref.extractall(gt_path)  # Extrae todos los archivos
+
+  print(f"Descomprimido en: {gt_path}")
+  # Carpeta destino del dataset
+  dest_folder = gt_path   
+  dest_folder.mkdir(exist_ok=True)
+
+  # Recorrer las subcarpetas dentro de ground-truth
+  for subdir in list(gt_path.iterdir()):  
+      if subdir.is_dir() and subdir != gt_path:
+          print(f"Fusionando: {subdir}")
+
+          for content in list(subdir.iterdir()):  # Recorrer contenido de la subcarpeta
+              dest_path = gt_path  # Ruta destino
+
+              if content.is_dir():  # Si es una carpeta, fusionar su contenido
+                  for sub_content in content.iterdir():
+                      shutil.move(str(sub_content), str(dest_path / sub_content.name))
+                  content.rmdir()  # Eliminar carpeta vacía después de mover contenido
+
+              else:  # Si es un archivo, moverlo directamente
+                  shutil.move(str(content), str(dest_path))
+
+          subdir.rmdir()  # Eliminar la carpeta vacía
+
+  print(f"¡Carpetas fusionadas en '{gt_path}'!")
+
+def read_data():
+  global model_path_onnx 
+  global model_path_pkl 
+  global images_sample 
+  global image_path 
+  global colors 
+  global CLASSES
+  global base_path
+  
+  model_name = url_model.split("/")[-2]
+  base_path = Path(__file__).resolve().parent.parent / Path("models")
+  model_path_onnx = base_path / model_name / Path("best.onnx") 
+  model_path_pkl = base_path / model_name / Path("best.pkl")
+
+  model_path_onnx.parent.mkdir(parents=True, exist_ok=True)
+
+  if not Path(model_path_onnx).is_file():
+    print(f"El modelo ONNX no existe en: {model_path_onnx}")
+    print("Descargando...")
+    print(model_path_onnx.parent)
+    
+    response = requests.get(url_model, allow_redirects=True)
+    print("response")
+    with open(model_path_onnx, "wb") as file:
+      file.write(response.content)
+    print(f"Modelo descargado en {model_path_onnx}")
+  
+  # Directorio de imágenes y lista de imágenes
+  dir_images_path = base_path / Path("ground-truth")
+  # Descarga dataset si no existe
+  if not dir_images_path.exists():
+    process_dataset()
+  images_sample = sorted([img for ext in ["*.jpg", "*.jpeg", "*.png"] for img in dir_images_path.glob(ext)])
+  image_path = dir_images_path / Path("Avances-Elite-Toluquilla-II-a-julio-2024_mp4-0021.jpg") # Imagen especifica
+  yaml_path = base_path / Path("ground-truth/data.yaml")
+
+  # Cargar clases desde el archivo YAML
+  with yaml_path.open("r") as f:
+      data = yaml.safe_load(f)
+  CLASSES = data.get("names", [])
+  np.random.seed(42)
+  colors = np.random.uniform(0, 255, size=(len(CLASSES), 3)) # Generar colores para cada clase
 
 def preprocess_image(image, target_size=(640, 480)):
   """
@@ -258,14 +330,7 @@ def compilar_modelo():
 print("Classes: ", CLASSES) if debug else None
 
 os.chdir("/tmp")
-if not Path(model_path_onnx).is_file():
-  print(f"El modelo ONNX no existe en: {model_path_onnx}")
-  print("Descargando...")
-  Path(base_path).mkdir(parents=True, exist_ok=True)
-  response = requests.get(url_model, allow_redirects=True)
-  with open(model_path_onnx, "wb") as file:
-    file.write(response.content)
-  print(f"Modelo descargado en {model_path_onnx}")
+read_data()
 
 onnx_model = onnx.load(open(model_path_onnx, "rb"))
 input_shapes = {inp.name:tuple(x.dim_value for x in inp.type.tensor_type.shape.dim) for inp in onnx_model.graph.input}
