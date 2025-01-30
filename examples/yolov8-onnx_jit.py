@@ -7,6 +7,7 @@ import cv2
 import onnx
 import numpy as np
 import yaml
+import requests
 from pathlib import Path
 from onnx.helper import tensor_dtype_to_np_dtype
 
@@ -40,15 +41,15 @@ os.environ.setdefault("DEFAULT_FLOAT", "HALF")
 dir_images_path = Path("/home/manuelo247/models/ground-Truth/images/")
 images_sample = sorted([img for ext in ["*.jpg", "*.jpeg", "*.png"] for img in dir_images_path.glob(ext)])
 image_path = dir_images_path / Path("Avances-Elite-Toluquilla-II-a-julio-2024_mp4-0021.jpg") # Imagen especifica
+yaml_path = Path("/home/manuelo247/models/ground-Truth/data.yaml")
 
 # Ruta para los modelos
-base_path = Path("/home/manuelo247/models/boxes/yoloV8-Medium-NucleaV9/")
-model_path_pt = base_path / Path("best.pt") 
+url_model = "https://github.com/covenant-org/tinygrad/releases/download/yoloV8-Medium-NucleaV9/best.onnx" # URL de descarga
+base_path = Path(__file__).resolve().parent.parent / Path("models")
 model_path_onnx = base_path / Path("best.onnx") 
 model_path_pkl = base_path / Path("best.pkl")
 
 # Cargar clases desde el archivo YAML
-yaml_path = Path("/home/manuelo247/models/ground-Truth/data.yaml")
 with yaml_path.open("r") as f:
     data = yaml.safe_load(f)
 CLASSES = data.get("names", [])
@@ -70,6 +71,8 @@ class Timer:
         if self.start_time is None:
             raise ValueError("El timer no ha sido iniciado. Usa start() primero.")
         return int(round(((time.time() - self.start_time) * 1000)))
+
+
 
 def draw_bounding_box(img, class_id, confidence, x, y, x_plus_w, y_plus_h):
       label = f'{CLASSES[class_id]} ({confidence:.2f})'
@@ -186,10 +189,7 @@ def postprocess_image(output_tensor, original_image):
   return resized_image
     
 def compilar_modelo():
-  onnx_model = onnx.load(open(model_path_onnx, "rb"))
-  input_shapes = {inp.name:tuple(x.dim_value for x in inp.type.tensor_type.shape.dim) for inp in onnx_model.graph.input}
-  print("Input shapes:", input_shapes) if debug else None
-  
+
   run_onnx = OnnxRunner(onnx_model)
   run_onnx_jit = TinyJit(
     lambda **kwargs:
@@ -197,7 +197,6 @@ def compilar_modelo():
       prune=True
   )
 
-  input_shapes = {inp.name: tuple(x.dim_value for x in inp.type.tensor_type.shape.dim) for inp in onnx_model.graph.input}
   input_types = {inp.name: tensor_dtype_to_np_dtype(inp.type.tensor_type.elem_type) for inp in onnx_model.graph.input}
   input_types = {k:(np.float32 if v==np.float16 else v) for k,v in input_types.items()}
   print("input shapes: ", input_shapes)
@@ -209,7 +208,8 @@ def compilar_modelo():
         image = cv2.imread(images_sample[i])
         if image is None:
             raise ValueError("No se pudo cargar la imagen.")
-        model_input = preprocess_image(image, target_size=(640, 480))
+
+        model_input = preprocess_image(image, target_size=target_size)
 
         print(model_input)
         # Ejecutar el modelo con las entradas
@@ -245,11 +245,10 @@ def compilar_modelo():
   if (allowed_gated_read_image:=getenv("ALLOWED_GATED_READ_IMAGE", -1)) != -1:
     assert gated_read_image_count <= allowed_gated_read_image, f"too many gated read_image! {gated_read_image_count=}, {allowed_gated_read_image=}"
 
-  OUTPUT = "/home/manuelo247/models/boxes/yoloV8-Medium-NucleaV9/best.pkl"
-  with open(OUTPUT, "wb") as f:
+  with open(model_path_pkl, "wb") as f:
     pickle.dump(run_onnx_jit, f)
   mdl_sz = os.path.getsize(model_path_onnx)
-  pkl_sz = os.path.getsize(OUTPUT)
+  pkl_sz = os.path.getsize(model_path_pkl)
   print(f"mdl size is {mdl_sz/1e6:.2f}M")
   print(f"pkl size is {pkl_sz/1e6:.2f}M")
   print("**** compile done ****")
@@ -260,7 +259,17 @@ print("Classes: ", CLASSES) if debug else None
 
 os.chdir("/tmp")
 if not Path(model_path_onnx).is_file():
-  raise FileNotFoundError(f"El modelo ONNX no existe en: {model_path_onnx}")
+  print(f"El modelo ONNX no existe en: {model_path_onnx}")
+  print("Descargando...")
+  Path(base_path).mkdir(parents=True, exist_ok=True)
+  response = requests.get(url_model, allow_redirects=True)
+  with open(model_path_onnx, "wb") as file:
+    file.write(response.content)
+  print(f"Modelo descargado en {model_path_onnx}")
+
+onnx_model = onnx.load(open(model_path_onnx, "rb"))
+input_shapes = {inp.name:tuple(x.dim_value for x in inp.type.tensor_type.shape.dim) for inp in onnx_model.graph.input}
+target_size = tuple(reversed(input_shapes['images'][2:]))
 
 if not Path(model_path_pkl).is_file():
   print(f"El archivo '{model_path_pkl}' no existe.")
@@ -280,9 +289,9 @@ for image_path in images_sample:
   original_image = cv2.imread(image_path)
   if original_image is None:
       raise FileNotFoundError("No se pudo cargar la imagen.")
-    
+  
   # Pre-procesar la imagen a inputs que espera en modelo tinyjit
-  model_input = preprocess_image(original_image, target_size=(640, 480))
+  model_input = preprocess_image(original_image, target_size=target_size)
   preinferencia_time = timer.stop()
   
   # Ejecutar la inferencia
