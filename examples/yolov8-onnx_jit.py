@@ -12,8 +12,7 @@ from pathlib import Path
 import zipfile
 import shutil
 from onnx.helper import tensor_dtype_to_np_dtype
-
-
+from tqdm import tqdm
 
 # Agregar directorio de 'extra'
 sys.path.append(str(Path(__file__).resolve().parent.parent))
@@ -44,6 +43,7 @@ os.environ.setdefault("DEFAULT_FLOAT", "HALF")
 # Ruta para los modelos
 url_model = "https://github.com/covenant-org/tinygrad/releases/download/yoloV8-Medium-NucleaV9/best.onnx" # URL de descarga
 url_dataset = "https://app.roboflow.com/ds/qnXOxt8VKv?key=1mmF2G81LD"
+model_path_pkl = ""
 
 debug = False
 
@@ -61,96 +61,76 @@ class Timer:
             raise ValueError("El timer no ha sido iniciado. Usa start() primero.")
         return int(round(((time.time() - self.start_time) * 1000)))
 
+class ModelDownloader:
+    def __init__(self, url_model: str = None, url_dataset: str = None):
+        self.base_path = Path(__file__).resolve().parent.parent / "models"
+        self.url_model = url_model
+        if self.url_model:
+            self.model_name = self.url_model.split("/")[-2]
+        self.model_path_onnx = self.base_path / self.model_name / "best.onnx"
+        self.zip_path = self.base_path / "dataset.zip"
+        self.gt_path = self.base_path / "ground-truth"
+        self.url_dataset = url_dataset
+        
+        self.base_path.mkdir(parents=True, exist_ok=True)
+ 
+    def download_model(self):
+        self.model_path_onnx.parent.mkdir(parents=True, exist_ok=True)
 
+        if not self.model_path_onnx.is_file():
+            print(f"El modelo ONNX no existe en: {self.model_path_onnx}")
+            print(f"Descargando desde {self.url_model}...")
+            
+            response = requests.get(self.url_model, allow_redirects=True)
+            with open(self.model_path_onnx, "wb") as file:
+                file.write(response.content)
+            print(f"Modelo descargado en {self.model_path_onnx}")
+    
+    def download_dataset(self):
+        self.gt_path.mkdir(parents=True, exist_ok=True)
+        
+        if not self.zip_path.is_file():
+            print(f"Descargando dataset desde: {self.url_dataset}")
+            response = requests.get(self.url_dataset, allow_redirects=True)
+            with open(self.zip_path, "wb") as file:
+                file.write(response.content)
+        if not any(self.gt_path.iterdir()):
+            print(f"Descomprimiendo dataset desde {self.zip_path}...")
+            with zipfile.ZipFile(self.zip_path, "r") as zip_ref:
+                zip_ref.extractall(self.gt_path)
+            print(f"Descomprimido en: {self.gt_path}")
+            self.merge_folders(self.gt_path)
+        self.load_yaml()
+        
+    def load_yaml(self):
+        self.yaml_path = self.gt_path / Path("data.yaml")
+        # Cargar clases desde el archivo YAML
+        with self.yaml_path.open("r") as f:
+            data = yaml.safe_load(f)
+        self.classes = data.get("names", [])
+        np.random.seed(42)
+        self.classes_color = np.random.uniform(0, 255, size=(len(self.classes), 3)) # Generar colores para cada clase
 
-def draw_bounding_box(img, class_id, confidence, x, y, x_plus_w, y_plus_h):
-  label = f'{CLASSES[class_id]} ({confidence:.2f})'
-  color = colors[class_id]
+    def merge_folders(self, gt_path: Path):
+        for subdir in list(gt_path.iterdir()):  
+            if subdir.is_dir() and subdir != gt_path:  # Asegurar que es una subcarpeta
+                # print(f"Fusionando: {subdir}")
+                for content in list(subdir.iterdir()):
+                    dest_path = gt_path
+                    if content.is_dir():  # Fusionar carpetas
+                        for sub_content in content.iterdir():
+                            shutil.move(str(sub_content), str(dest_path / sub_content.name))
+                        content.rmdir()
+                    else:
+                        shutil.move(str(content), str(dest_path))
+                subdir.rmdir()
+        # print(f"¡Carpetas fusionadas en '{gt_path}'!")
+
+def draw_bounding_box(img, data_model, class_id, confidence, x, y, x_plus_w, y_plus_h):
+  label = f'{data_model.classes[class_id]} ({confidence:.2f})'
+  color = data_model.classes_color[class_id]
   cv2.rectangle(img, (x, y), (x_plus_w, y_plus_h), color, 2)
   cv2.putText(img, label, (x - 10, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-
-def process_dataset():
-  zip_path = base_path / Path("dataset.zip" )
-  gt_path = base_path / Path("ground-truth")
-
-  if not zip_path.exists():
-    print(f"No existe {zip_path}")
-    print("Descargando...")
-    response = requests.get(url_dataset, allow_redirects=True)
-    with open(zip_path, "wb") as file:
-        file.write(response.content)
-    print("Descargado en {zip_path}")
-      
-  with zipfile.ZipFile(zip_path, "r") as zip_ref:
-      zip_ref.extractall(gt_path)  # Extrae todos los archivos
-
-  print(f"Descomprimido en: {gt_path}")
-  # Carpeta destino del dataset
-  dest_folder = gt_path   
-  dest_folder.mkdir(exist_ok=True)
-
-  # Recorrer las subcarpetas dentro de ground-truth
-  for subdir in list(gt_path.iterdir()):  
-      if subdir.is_dir() and subdir != gt_path:
-          print(f"Fusionando: {subdir}")
-
-          for content in list(subdir.iterdir()):  # Recorrer contenido de la subcarpeta
-              dest_path = gt_path  # Ruta destino
-
-              if content.is_dir():  # Si es una carpeta, fusionar su contenido
-                  for sub_content in content.iterdir():
-                      shutil.move(str(sub_content), str(dest_path / sub_content.name))
-                  content.rmdir()  # Eliminar carpeta vacía después de mover contenido
-
-              else:  # Si es un archivo, moverlo directamente
-                  shutil.move(str(content), str(dest_path))
-
-          subdir.rmdir()  # Eliminar la carpeta vacía
-
-  print(f"¡Carpetas fusionadas en '{gt_path}'!")
-
-def read_data():
-  global model_path_onnx 
-  global model_path_pkl 
-  global images_sample 
-  global image_path 
-  global colors 
-  global CLASSES
-  global base_path
-  
-  model_name = url_model.split("/")[-2]
-  base_path = Path(__file__).resolve().parent.parent / Path("models")
-  model_path_onnx = base_path / model_name / Path("best.onnx") 
-  model_path_pkl = base_path / model_name / Path("best.pkl")
-
-  model_path_onnx.parent.mkdir(parents=True, exist_ok=True)
-
-  if not Path(model_path_onnx).is_file():
-    print(f"El modelo ONNX no existe en: {model_path_onnx}")
-    print("Descargando...")
-    print(model_path_onnx.parent)
-    
-    response = requests.get(url_model, allow_redirects=True)
-    print("response")
-    with open(model_path_onnx, "wb") as file:
-      file.write(response.content)
-    print(f"Modelo descargado en {model_path_onnx}")
-  
-  # Directorio de imágenes y lista de imágenes
-  dir_images_path = base_path / Path("ground-truth")
-  # Descarga dataset si no existe
-  if not dir_images_path.exists():
-    process_dataset()
-  images_sample = sorted([img for ext in ["*.jpg", "*.jpeg", "*.png"] for img in dir_images_path.glob(ext)])
-  image_path = dir_images_path / Path("Avances-Elite-Toluquilla-II-a-julio-2024_mp4-0021.jpg") # Imagen especifica
-  yaml_path = base_path / Path("ground-truth/data.yaml")
-
-  # Cargar clases desde el archivo YAML
-  with yaml_path.open("r") as f:
-      data = yaml.safe_load(f)
-  CLASSES = data.get("names", [])
-  np.random.seed(42)
-  colors = np.random.uniform(0, 255, size=(len(CLASSES), 3)) # Generar colores para cada clase
 
 def preprocess_image(image, target_size=(640, 480)):
   """
@@ -183,7 +163,7 @@ def preprocess_image(image, target_size=(640, 480)):
 
   return inputs
 
-def postprocess_image(output_tensor, original_image):
+def postprocess_image(output_tensor, original_image, data_model):
   timer = Timer()
   timer.start()
   
@@ -242,7 +222,7 @@ def postprocess_image(output_tensor, original_image):
       box = boxes[index]
       detection = {
           'class_id': class_ids[index],
-          'class_name': CLASSES[class_ids[index]],
+          'class_name': data_model.classes[class_ids[index]],
           'confidence': scores[index],
           'box': box,
           'scale': scale
@@ -251,7 +231,7 @@ def postprocess_image(output_tensor, original_image):
       
        # Dibujar las cajas en la imagen redimensionada
       x, y, x_plus_w, y_plus_h = round(box[0] * scale), round(box[1] * scale), round((box[0] + box[2]) * scale), round((box[1] + box[3]) * scale)
-      draw_bounding_box(resized_image, class_ids[index], scores[index], x, y, x_plus_w, y_plus_h)
+      draw_bounding_box(resized_image, data_model, class_ids[index], scores[index], x, y, x_plus_w, y_plus_h)
       
   
   # resized_image = cv2.resize(resized_image, (height, width))
@@ -260,8 +240,7 @@ def postprocess_image(output_tensor, original_image):
   
   return resized_image
     
-def compilar_modelo():
-
+def compilar_modelo(onnx_model, data_model, images_sample, model_path_pkl):
   run_onnx = OnnxRunner(onnx_model)
   run_onnx_jit = TinyJit(
     lambda **kwargs:
@@ -319,7 +298,7 @@ def compilar_modelo():
 
   with open(model_path_pkl, "wb") as f:
     pickle.dump(run_onnx_jit, f)
-  mdl_sz = os.path.getsize(model_path_onnx)
+  mdl_sz = os.path.getsize(data_model.model_path_onnx)
   pkl_sz = os.path.getsize(model_path_pkl)
   print(f"mdl size is {mdl_sz/1e6:.2f}M")
   print(f"pkl size is {pkl_sz/1e6:.2f}M")
@@ -327,58 +306,70 @@ def compilar_modelo():
   
   return run_onnx_jit
 
-print("Classes: ", CLASSES) if debug else None
+if __name__ == "__main__":
+  os.chdir("/tmp")
+  data_model = ModelDownloader(url_model = "https://github.com/covenant-org/tinygrad/releases/download/yoloV8-Medium-NucleaV9/best.onnx",
+                               url_dataset = "https://app.roboflow.com/ds/qnXOxt8VKv?key=1mmF2G81LD")
+  data_model.download_model()
+  data_model.download_dataset()
+  print("Classes: ", data_model.classes) if debug else None
+  
+  # Directorio de imágenes y lista de imágenes
+  dir_images_path = data_model.gt_path
+  images_sample = sorted([img for ext in ["*.jpg", "*.jpeg", "*.png"] for img in dir_images_path.glob(ext)])
+  image_path = dir_images_path / Path("Avances-Elite-Toluquilla-II-a-julio-2024_mp4-0021.jpg") # Imagen especifica
 
-os.chdir("/tmp")
-read_data()
+  onnx_model = onnx.load(open(data_model.model_path_onnx, "rb"))
+  input_shapes = {inp.name:tuple(x.dim_value for x in inp.type.tensor_type.shape.dim) for inp in onnx_model.graph.input}
+  target_size = tuple(reversed(input_shapes['images'][2:]))
 
-onnx_model = onnx.load(open(model_path_onnx, "rb"))
-input_shapes = {inp.name:tuple(x.dim_value for x in inp.type.tensor_type.shape.dim) for inp in onnx_model.graph.input}
-target_size = tuple(reversed(input_shapes['images'][2:]))
+  if not model_path_pkl:
+    model_path_pkl = data_model.model_path_onnx.parent / "best.pkl"
+  if not Path(model_path_pkl).is_file():
+    print(f"El archivo '{model_path_pkl}' no existe.")
+    
+    print(f"Compilando...")
+    run_onnx_jit = compilar_modelo(onnx_model, data_model, images_sample, model_path_pkl)
+  else: 
+      print(f"Abriendo modelo compilado en {model_path_pkl}")
+      with open(model_path_pkl, "rb") as f:
+          run_onnx_jit = pickle.load(f)
+    
+  print(run_onnx_jit) if debug else None
+  # exit()
 
-if not Path(model_path_pkl).is_file():
-  print(f"El archivo '{model_path_pkl}' no existe.")
-  print(f"Compilando...")
-  run_onnx_jit = compilar_modelo()
-else: 
-    print(f"Abriendo modelo compilado en {model_path_pkl}")
-    with open(model_path_pkl, "rb") as f:
-        run_onnx_jit = pickle.load(f)
-  
-print(run_onnx_jit) if debug else None
-
-# images_sample = ["Avances-Elite-Toluquilla-II-a-julio-2024_mp4-0021.jpg"]
-timer = Timer()
-for image_path in images_sample:
-  timer.start()
-  original_image = cv2.imread(image_path)
-  if original_image is None:
-      raise FileNotFoundError("No se pudo cargar la imagen.")
-  
-  # Pre-procesar la imagen a inputs que espera en modelo tinyjit
-  model_input = preprocess_image(original_image, target_size=target_size)
-  preinferencia_time = timer.stop()
-  
-  # Ejecutar la inferencia
-  timer.start()
-  output_tensor = run_onnx_jit(**model_input)  
-  inferencia_time = timer.stop()
-  
-  print("Raw tensor: ", output_tensor) if debug else None
-  
-  # Post-procesar la imagen con las detecciones
-  timer.start()
-  postprocessed_image = postprocess_image(output_tensor, original_image)
-  postinferencia_time = timer.stop()
-  
-  # Imprimir velocidad del modelo
-  print(f"Pre-inferencia: {preinferencia_time}ms, Inferencia: {inferencia_time}ms, Post-inferencia: {postinferencia_time}ms")
-  
-  # Mostrar la imagen con las detecciones
-  cv2.imshow("Tinygrad model", postprocessed_image)
-  if cv2.waitKey(1) & 0xFF == ord('q'):
-      break
-cv2.destroyAllWindows()
+  # images_sample = ["Avances-Elite-Toluquilla-II-a-julio-2024_mp4-0021.jpg"]
+  timer = Timer()
+  for image_path in images_sample:
+    timer.start()
+    original_image = cv2.imread(image_path)
+    if original_image is None:
+        raise FileNotFoundError("No se pudo cargar la imagen.")
+    
+    # Pre-procesar la imagen a inputs que espera en modelo tinyjit
+    model_input = preprocess_image(original_image, target_size=target_size)
+    preinferencia_time = timer.stop()
+    
+    # Ejecutar la inferencia
+    timer.start()
+    output_tensor = run_onnx_jit(**model_input)  
+    inferencia_time = timer.stop()
+    
+    print("Raw tensor: ", output_tensor) if debug else None
+    
+    # Post-procesar la imagen con las detecciones
+    timer.start()
+    postprocessed_image = postprocess_image(output_tensor, original_image, data_model)
+    postinferencia_time = timer.stop()
+    
+    # Imprimir velocidad del modelo
+    print(f"Pre-inferencia: {preinferencia_time}ms, Inferencia: {inferencia_time}ms, Post-inferencia: {postinferencia_time}ms")
+    
+    # Mostrar la imagen con las detecciones
+    cv2.imshow("Tinygrad model", postprocessed_image)
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
+  cv2.destroyAllWindows()
 
 # # Guardar o mostrar la imagen con las detecciones
 # output_path = "output_image.jpg"
