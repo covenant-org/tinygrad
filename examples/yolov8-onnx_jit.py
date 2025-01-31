@@ -11,6 +11,7 @@ import requests
 from pathlib import Path
 import zipfile
 import shutil
+import argparse
 from onnx.helper import tensor_dtype_to_np_dtype
 from tqdm import tqdm
 
@@ -40,10 +41,23 @@ os.environ.setdefault("DEFAULT_FLOAT", "HALF")
 # os.environ.setdefault("PROFILE", "1")
 # os.environ.setdefault("JIT_BATCH_SIZE", "0")
 
-# Ruta para los modelos
-url_model = "https://github.com/covenant-org/tinygrad/releases/download/yoloV8-Medium-NucleaV9/best.onnx" # URL de descarga
-url_dataset = "https://app.roboflow.com/ds/qnXOxt8VKv?key=1mmF2G81LD"
-model_path_pkl = ""
+# Crear el parser
+parser = argparse.ArgumentParser(description="Descargar modelo y dataset")
+# Agregar argumentos
+parser.add_argument("--url_model", type=str, default="https://github.com/covenant-org/tinygrad/releases/download/yoloV8-Nano-NucleaV9/best.onnx", help="URL del modelo ONNX")
+parser.add_argument("--url_dataset", type=str, default="https://app.roboflow.com/ds/qnXOxt8VKv?key=1mmF2G81LD", help="URL del dataset")
+parser.add_argument("--model_path_pkl", type=str, default="", help="Direccion del pkl")
+parser.add_argument("--imshow", type=str, default="False", help="Mostrar imágenes a tiempo real")
+args = parser.parse_args()
+
+url_model = args.url_model
+url_dataset = args.url_dataset
+model_path_pkl = args.model_path_pkl
+args.imshow = args.imshow.lower() in ["true", "1", "yes"]
+
+# Usar los valores en el código
+print(f"URL del modelo: {args.url_model}")
+print(f"URL del dataset: {args.url_dataset}")
 
 debug = False
 
@@ -308,8 +322,7 @@ def compilar_modelo(onnx_model, data_model, images_sample, model_path_pkl):
 
 if __name__ == "__main__":
   os.chdir("/tmp")
-  data_model = ModelDownloader(url_model = "https://github.com/covenant-org/tinygrad/releases/download/yoloV8-Medium-NucleaV9/best.onnx",
-                               url_dataset = "https://app.roboflow.com/ds/qnXOxt8VKv?key=1mmF2G81LD")
+  data_model = ModelDownloader(url_model, url_dataset)
   data_model.download_model()
   data_model.download_dataset()
   print("Classes: ", data_model.classes) if debug else None
@@ -366,9 +379,10 @@ if __name__ == "__main__":
     print(f"Pre-inferencia: {preinferencia_time}ms, Inferencia: {inferencia_time}ms, Post-inferencia: {postinferencia_time}ms")
     
     # Mostrar la imagen con las detecciones
-    cv2.imshow("Tinygrad model", postprocessed_image)
-    if cv2.waitKey(1) & 0xFF == ord('q'):
-        break
+    if args.imshow:
+      cv2.imshow("Tinygrad model", postprocessed_image)
+      if cv2.waitKey(1) & 0xFF == ord('q'):
+          break
   cv2.destroyAllWindows()
 
 # # Guardar o mostrar la imagen con las detecciones
