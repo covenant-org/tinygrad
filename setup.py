@@ -35,6 +35,13 @@ setup(name='tinygrad',
             "ruff",
             "types-tqdm",
         ],
+        "nuclea": [
+        "opencv-python",
+        "onnx",
+        "numpy",
+        "pyyaml",
+        "requests",
+        ],
         #'mlperf': ["mlperf-logging @ git+https://github.com/mlperf/logging.git@4.1.0-rc3"],
         'testing': [
             "numpy",
