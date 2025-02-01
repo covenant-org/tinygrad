@@ -13,7 +13,6 @@ import zipfile
 import shutil
 import argparse
 from onnx.helper import tensor_dtype_to_np_dtype
-from tqdm import tqdm
 
 # Agregar directorio de 'extra'
 sys.path.append(str(Path(__file__).resolve().parent.parent))
@@ -44,15 +43,13 @@ os.environ.setdefault("DEFAULT_FLOAT", "HALF")
 # Crear el parser
 parser = argparse.ArgumentParser(description="Descargar modelo y dataset")
 # Agregar argumentos
-parser.add_argument("--url_model", type=str, default="https://github.com/covenant-org/tinygrad/releases/download/yoloV8-Nano-NucleaV9/best.onnx", help="URL del modelo ONNX")
+parser.add_argument("--url_model", type=str, default="https://github.com/covenant-org/tinygrad/releases/download/yoloV8-Medium-NucleaV9/best.onnx", help="URL del modelo ONNX")
 parser.add_argument("--url_dataset", type=str, default="https://app.roboflow.com/ds/qnXOxt8VKv?key=1mmF2G81LD", help="URL del dataset")
 parser.add_argument("--model_path_pkl", type=str, default="", help="Direccion del pkl")
-parser.add_argument("--imshow", type=str, default="False", help="Mostrar imágenes a tiempo real")
+parser.add_argument("--imshow", type=str, default="True", help="Mostrar imágenes a tiempo real")
+parser.add_argument("--device", type=str, default="", help="Mostrar imágenes a tiempo real")
 args = parser.parse_args()
 
-url_model = args.url_model
-url_dataset = args.url_dataset
-model_path_pkl = args.model_path_pkl
 args.imshow = args.imshow.lower() in ["true", "1", "yes"]
 
 # Usar los valores en el código
@@ -255,6 +252,11 @@ def postprocess_image(output_tensor, original_image, data_model):
   return resized_image
     
 def compilar_modelo(onnx_model, data_model, images_sample, model_path_pkl):
+  if args.device:
+    Device.DEFAULT = args.device
+    
+  print(Device.DEFAULT)
+  
   run_onnx = OnnxRunner(onnx_model)
   run_onnx_jit = TinyJit(
     lambda **kwargs:
@@ -322,7 +324,7 @@ def compilar_modelo(onnx_model, data_model, images_sample, model_path_pkl):
 
 if __name__ == "__main__":
   os.chdir("/tmp")
-  data_model = ModelDownloader(url_model, url_dataset)
+  data_model = ModelDownloader(args.url_model, args.url_dataset)
   data_model.download_model()
   data_model.download_dataset()
   print("Classes: ", data_model.classes) if debug else None
@@ -336,16 +338,16 @@ if __name__ == "__main__":
   input_shapes = {inp.name:tuple(x.dim_value for x in inp.type.tensor_type.shape.dim) for inp in onnx_model.graph.input}
   target_size = tuple(reversed(input_shapes['images'][2:]))
 
-  if not model_path_pkl:
-    model_path_pkl = data_model.model_path_onnx.parent / "best.pkl"
-  if not Path(model_path_pkl).is_file():
-    print(f"El archivo '{model_path_pkl}' no existe.")
+  if not args.model_path_pkl:
+    args.model_path_pkl = data_model.model_path_onnx.parent / "best.pkl"
+  if not Path(args.model_path_pkl).is_file():
+    print(f"El archivo '{args.model_path_pkl}' no existe.")
     
     print(f"Compilando...")
-    run_onnx_jit = compilar_modelo(onnx_model, data_model, images_sample, model_path_pkl)
+    run_onnx_jit = compilar_modelo(onnx_model, data_model, images_sample, args.model_path_pkl)
   else: 
-      print(f"Abriendo modelo compilado en {model_path_pkl}")
-      with open(model_path_pkl, "rb") as f:
+      print(f"Abriendo modelo compilado en {args.model_path_pkl}")
+      with open(args.model_path_pkl, "rb") as f:
           run_onnx_jit = pickle.load(f)
     
   print(run_onnx_jit) if debug else None
@@ -353,7 +355,8 @@ if __name__ == "__main__":
 
   # images_sample = ["Avances-Elite-Toluquilla-II-a-julio-2024_mp4-0021.jpg"]
   timer = Timer()
-  for image_path in images_sample:
+  acum_time = []
+  for image_path in images_sample[:10]:
     timer.start()
     original_image = cv2.imread(image_path)
     if original_image is None:
@@ -378,12 +381,16 @@ if __name__ == "__main__":
     # Imprimir velocidad del modelo
     print(f"Pre-inferencia: {preinferencia_time}ms, Inferencia: {inferencia_time}ms, Post-inferencia: {postinferencia_time}ms")
     
+    total_time = preinferencia_time + inferencia_time + postinferencia_time
+    acum_time.append(total_time)
+    
     # Mostrar la imagen con las detecciones
     if args.imshow:
       cv2.imshow("Tinygrad model", postprocessed_image)
       if cv2.waitKey(1) & 0xFF == ord('q'):
           break
   cv2.destroyAllWindows()
+  print(f"\tMedian: {np.median(acum_time)}ms")
 
 # # Guardar o mostrar la imagen con las detecciones
 # output_path = "output_image.jpg"

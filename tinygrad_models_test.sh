@@ -19,7 +19,6 @@ MODELS=(
     "https://github.com/covenant-org/tinygrad/releases/download/yoloV8-Nano-NucleaV9/best.onnx"
 )
 
-# Ejecutar cada modelo secuencialmente
 for MODEL_URL in "${MODELS[@]}"; do
     echo "Ejecutando modelo: $MODEL_URL"
     $PYTHON_EXEC $SCRIPT_PATH --url_model "$MODEL_URL" --imshow "False"
