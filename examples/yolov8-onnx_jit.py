@@ -111,9 +111,9 @@ class ModelDownloader:
                 zip_ref.extractall(self.gt_path)
             print(f"Descomprimido en: {self.gt_path}")
             self.merge_folders(self.gt_path)
-        self.load_yaml()
+        self.get_yaml_data()
         
-    def load_yaml(self):
+    def get_yaml_data(self):
         self.yaml_path = self.gt_path / Path("data.yaml")
         # Cargar clases desde el archivo YAML
         with self.yaml_path.open("r") as f:
@@ -136,215 +136,178 @@ class ModelDownloader:
                         shutil.move(str(content), str(dest_path))
                 subdir.rmdir()
         # print(f"¡Carpetas fusionadas en '{gt_path}'!")
-
-def draw_bounding_box(img, data_model, class_id, confidence, x, y, x_plus_w, y_plus_h):
-  label = f'{data_model.classes[class_id]} ({confidence:.2f})'
-  color = data_model.classes_color[class_id]
-  cv2.rectangle(img, (x, y), (x_plus_w, y_plus_h), color, 2)
-  cv2.putText(img, label, (x - 10, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-
-def preprocess_image(image, target_size=(640, 480)):
-  """
-    Preprocesa la imagen para que sea compatible con el modelo. Realiza:
-    1. Redimensionamiento de la imagen.
-    2. Normalización de valores de píxeles.
-    3. Cambio de formato de HWC a CHW.
-    4. Añadido de dimensión de lote.
-    5. Diccionario creado con las entradas procesadas
     
-    Args:
-        image (np.ndarray): Imagen de entrada en formato HWC.
-        target_size (tuple): Tamaño al que redimensionar la imagen (alto, ancho).
-        
-    Returns:
-        dict: Diccionario con las entradas procesadas para el modelo.
-  """
-  resized_image = cv2.resize(image, target_size)
-  normalized_image = resized_image.astype(np.float32) / 255.0
-  chw_image = np.transpose(normalized_image, (2, 0, 1))  # De HWC a CHW
-  batched_image = np.expand_dims(chw_image, axis=0)  # Añadir dimensión de lote
-  
-  new_inputs_numpy = {"images": batched_image}
-  
-  for k, v in new_inputs_numpy.items():
-    print(f"{k}: {v.shape}") if debug else None
-  
-  # Crear las entradas que el modelo espera, y asegurarse de que las claves coincidan con los nombres en el modelo
-  inputs = {k: Tensor(v, device="NPY").realize() for k, v in new_inputs_numpy.items()}
+    def get_dataset_images(self):
+      self.images_sample = sorted([img for ext in ["*.jpg", "*.jpeg", "*.png"] for img in self.gt_path.glob(ext)])
+      # image_path = dir_images_path / Path("Avances-Elite-Toluquilla-II-a-julio-2024_mp4-0021.jpg") # Imagen especifica
 
-  return inputs
 
-def postprocess_image(output_tensor, original_image, data_model):
-  timer = Timer()
-  timer.start()
-  
-  # Extraer caracteristicas de imagen
-  height, width, _ = original_image.shape
-  length = max(height, width)
-  scale = length / 640
-  
-  #
-  score_threshold = 0.45
-  
-  # Redimensionar la imagen a 640x480 para procesamiento
-  resized_image = cv2.resize(original_image, (640, 480))
-  fase1_timer = timer.stop()
-  
-  timer.start()
-  output_tensor = output_tensor.numpy()
-  # print(f"One value tensor: {output_tensor[0, 0, 0]}")
-  # output_tensor[0, 0, 0].realize()
-  # print(f"One value tensor: {output_tensor[0, 0, 0].item()}")
-  fase2_timer = timer.stop()
-  print("output_tensor:", output_tensor) if debug else None
-  
-  timer.start()
-  # Procesar tensor de salida y extraer caracteristicas
-  batch_size, num_classes_plus_5, num_boxes = output_tensor.shape # Extraer las dimensiones del tensor
-  output_tensor = np.transpose(output_tensor, (0, 2, 1)) # Transponer el tensor
-  rows = output_tensor.shape[1] # Extraes columbas del tensor
-  if debug:
-    print("batch_size", batch_size, "num_classes_plus_5", num_classes_plus_5, "num_boxes", num_boxes) 
-    print("Forma transpuesta:", output_tensor.shape) 
-    print("outputs: ", output_tensor) 
-    print("rows: ", rows) 
-  
-  boxes, scores, class_ids = [], [], []
-  for i in range(rows):
-      classes_scores = output_tensor[0][i][4:]
-      (minScore, maxScore, minClassLoc, (x, maxClassIndex)) = cv2.minMaxLoc(classes_scores)
-      if maxScore >= score_threshold:
-          box = [
-                output_tensor[0][i][0] - 0.5 * output_tensor[0][i][2],  # x1
-                output_tensor[0][i][1] - 0.5 * output_tensor[0][i][3],  # y1
-                output_tensor[0][i][2],  # w
-                output_tensor[0][i][3]   # h
-          ]
-          boxes.append(box)
-          scores.append(maxScore)
-          class_ids.append(maxClassIndex)
+class ModelProcessor:
+    def __init__(self, model_files, debug=False):
+        self.model_files = model_files
+        self.debug = debug
 
-  # Aplicar Non-Maximum Suppression  
-  nms_boxes = cv2.dnn.NMSBoxes(boxes, scores, score_threshold, 0.45, 0.5)
-  
-  detections = []
-  for i in range(len(nms_boxes)):
-      index = nms_boxes[i]
-      box = boxes[index]
-      detection = {
-          'class_id': class_ids[index],
-          'class_name': data_model.classes[class_ids[index]],
-          'confidence': scores[index],
-          'box': box,
-          'scale': scale
-      }
-      detections.append(detection)
-      
-       # Dibujar las cajas en la imagen redimensionada
-      x, y, x_plus_w, y_plus_h = round(box[0] * scale), round(box[1] * scale), round((box[0] + box[2]) * scale), round((box[1] + box[3]) * scale)
-      draw_bounding_box(resized_image, data_model, class_ids[index], scores[index], x, y, x_plus_w, y_plus_h)
-      
-  
-  # resized_image = cv2.resize(resized_image, (height, width))
-  fase3_timer = timer.stop()
-  print("Post-Inferencia: fase 1:", str(fase1_timer) + "ms,", "fase 2:", str(fase2_timer) + "ms,", "fase 3:", str(fase3_timer) + "ms")
-  
-  return resized_image
-    
-def compilar_modelo(onnx_model, data_model, images_sample, model_path_pkl):
-  if args.device:
-    Device.DEFAULT = args.device
-    
-  print(Device.DEFAULT)
-  
-  run_onnx = OnnxRunner(onnx_model)
-  run_onnx_jit = TinyJit(
-    lambda **kwargs:
-      next(iter(run_onnx({k:v.to(Device.DEFAULT) for k,v in kwargs.items()}).values())).cast('float32'), 
-      prune=True
-  )
+    def draw_bounding_box(self, img, class_id, confidence, x, y, x_plus_w, y_plus_h):
+        label = f'{self.model_files.classes[class_id]} ({confidence:.2f})'
+        color = self.model_files.classes_color[class_id]
+        cv2.rectangle(img, (x, y), (x_plus_w, y_plus_h), color, 2)
+        cv2.putText(img, label, (x - 10, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
-  input_types = {inp.name: tensor_dtype_to_np_dtype(inp.type.tensor_type.elem_type) for inp in onnx_model.graph.input}
-  input_types = {k:(np.float32 if v==np.float16 else v) for k,v in input_types.items()}
-  print("input shapes: ", input_shapes)
-  print("input types: ", input_types)
-  
-  for i in range(3):
-        GlobalCounters.reset()
-        print(f"run {i}")
-        image = cv2.imread(images_sample[i])
-        if image is None:
-            raise ValueError("No se pudo cargar la imagen.")
+    def preprocess_image(self, image, target_size=(640, 480)):
+        resized_image = cv2.resize(image, target_size)
+        normalized_image = resized_image.astype(np.float32) / 255.0
+        chw_image = np.transpose(normalized_image, (2, 0, 1))
+        batched_image = np.expand_dims(chw_image, axis=0)
 
-        model_input = preprocess_image(image, target_size=target_size)
+        new_inputs_numpy = {"images": batched_image}
 
-        print(model_input)
-        # Ejecutar el modelo con las entradas
-        with Context(DEBUG=max(DEBUG.value, 2 if i == 2 else 1)):
-            ret = run_onnx_jit(**model_input).numpy()
-        
-        # Copiar para la validación posterior
-        if i == 1:
-            test_val = np.copy(ret)
+        if self.debug:
+            for k, v in new_inputs_numpy.items():
+                print(f"{k}: {v.shape}")
 
-  print(f"captured {len(run_onnx_jit.captured.jit_cache)} kernels")
-  try:
-      np.testing.assert_allclose(test_val, ret, rtol=1e-3, atol=1e-3, err_msg="JIT run failed")
-      print("jit run validated")
-  except AssertionError as e:
-      print("Validation failed with differences:")
-      print(e)
-      
-  # checks from compile2
-  kernel_count = 0
-  read_image_count = 0
-  gated_read_image_count = 0
-  for ei in run_onnx_jit.captured.jit_cache:
-    if isinstance(ei.prg, CompiledRunner):
-      kernel_count += 1
-      read_image_count += ei.prg.p.src.count("read_image")
-      gated_read_image_count += ei.prg.p.src.count("?read_image")
-  print(f"{kernel_count=},  {read_image_count=}, {gated_read_image_count=}")
-  if (allowed_kernel_count:=getenv("ALLOWED_KERNEL_COUNT", -1)) != -1:
-    assert kernel_count <= allowed_kernel_count, f"too many kernels! {kernel_count=}, {allowed_kernel_count=}"
-  if (allowed_read_image:=getenv("ALLOWED_READ_IMAGE", -1)) != -1:
-    assert read_image_count == allowed_read_image, f"different read_image! {read_image_count=}, {allowed_read_image=}"
-  if (allowed_gated_read_image:=getenv("ALLOWED_GATED_READ_IMAGE", -1)) != -1:
-    assert gated_read_image_count <= allowed_gated_read_image, f"too many gated read_image! {gated_read_image_count=}, {allowed_gated_read_image=}"
+        inputs = {k: Tensor(v, device="NPY").realize() for k, v in new_inputs_numpy.items()}
+        return inputs
 
-  with open(model_path_pkl, "wb") as f:
-    pickle.dump(run_onnx_jit, f)
-  mdl_sz = os.path.getsize(data_model.model_path_onnx)
-  pkl_sz = os.path.getsize(model_path_pkl)
-  print(f"mdl size is {mdl_sz/1e6:.2f}M")
-  print(f"pkl size is {pkl_sz/1e6:.2f}M")
-  print("**** compile done ****")
-  
-  return run_onnx_jit
+    def postprocess_image(self, output_tensor, original_image):
+        timer = Timer()
+        timer.start()
+
+        height, width, _ = original_image.shape
+        scale = max(height, width) / 640
+        score_threshold = 0.45
+
+        resized_image = cv2.resize(original_image, (640, 480))
+        fase1_timer = timer.stop()
+
+        timer.start()
+        output_tensor = output_tensor.numpy()
+        fase2_timer = timer.stop()
+
+        if self.debug:
+            print("output_tensor:", output_tensor)
+
+        timer.start()
+        output_tensor = np.transpose(output_tensor, (0, 2, 1))
+        rows = output_tensor.shape[1]
+
+        if self.debug:
+            print(f"Forma transpuesta: {output_tensor.shape}")
+
+        boxes, scores, class_ids = [], [], []
+        for i in range(rows):
+            classes_scores = output_tensor[0][i][4:]
+            (_, maxScore, _, (_, maxClassIndex)) = cv2.minMaxLoc(classes_scores)
+            if maxScore >= score_threshold:
+                box = [
+                    output_tensor[0][i][0] - 0.5 * output_tensor[0][i][2],
+                    output_tensor[0][i][1] - 0.5 * output_tensor[0][i][3],
+                    output_tensor[0][i][2],
+                    output_tensor[0][i][3]
+                ]
+                boxes.append(box)
+                scores.append(maxScore)
+                class_ids.append(maxClassIndex)
+
+        nms_boxes = cv2.dnn.NMSBoxes(boxes, scores, score_threshold, 0.45, 0.5)
+        detections = []
+
+        for i in range(len(nms_boxes)):
+            index = nms_boxes[i]
+            box = boxes[index]
+            detection = {
+                'class_id': class_ids[index],
+                'class_name': self.model_files.classes[class_ids[index]],
+                'confidence': scores[index],
+                'box': box,
+                'scale': scale
+            }
+            detections.append(detection)
+
+            x, y, x_plus_w, y_plus_h = (
+                round(box[0] * scale),
+                round(box[1] * scale),
+                round((box[0] + box[2]) * scale),
+                round((box[1] + box[3]) * scale)
+            )
+            self.draw_bounding_box(resized_image, class_ids[index], scores[index], x, y, x_plus_w, y_plus_h)
+
+        fase3_timer = timer.stop()
+
+        print(f"Post-Inferencia: fase 1: {fase1_timer}ms, fase 2: {fase2_timer}ms, fase 3: {fase3_timer}ms")
+        return resized_image
+
+    def compile_model(self, onnx_model, images_sample, model_path_pkl):
+        Device.DEFAULT = getenv("DEVICE", "CPU")
+        print("Dispositivo:", Device.DEFAULT)
+
+        run_onnx = OnnxRunner(onnx_model)
+        run_onnx_jit = TinyJit(
+            lambda **kwargs: next(iter(run_onnx({k: v.to(Device.DEFAULT) for k, v in kwargs.items()}).values())).cast('float32'),
+            prune=True
+        )
+
+        input_types = {
+            inp.name: tensor_dtype_to_np_dtype(inp.type.tensor_type.elem_type) for inp in onnx_model.graph.input
+        }
+        input_types = {k: (np.float32 if v == np.float16 else v) for k, v in input_types.items()}
+
+        print("Input types:", input_types)
+
+        for i in range(3):
+            GlobalCounters.reset()
+            print(f"Ejecutando prueba {i}")
+
+            image = cv2.imread(images_sample[i])
+            if image is None:
+                raise ValueError("No se pudo cargar la imagen.")
+
+            model_input = self.preprocess_image(image)
+
+            with Context(DEBUG=2 if i == 2 else 1):
+                ret = run_onnx_jit(**model_input).numpy()
+
+            if i == 1:
+                test_val = np.copy(ret)
+
+        print(f"Captured {len(run_onnx_jit.captured.jit_cache)} kernels")
+
+        try:
+            np.testing.assert_allclose(test_val, ret, rtol=1e-3, atol=1e-3)
+            print("JIT validado correctamente")
+        except AssertionError as e:
+            print("Fallo en validación JIT:", e)
+
+        kernel_count = sum(1 for ei in run_onnx_jit.captured.jit_cache if isinstance(ei.prg, CompiledRunner))
+        print(f"Kernels compilados: {kernel_count}")
+
+        with open(model_path_pkl, "wb") as f:
+            pickle.dump(run_onnx_jit, f)
+
+        print(f"Modelo ONNX: {os.path.getsize(self.model_files.model_path_onnx) / 1e6:.2f} MB")
+        print(f"Modelo PKL: {os.path.getsize(model_path_pkl) / 1e6:.2f} MB")
+        print("**** Compilación finalizada ****")
+
+        return run_onnx_jit
 
 if __name__ == "__main__":
   os.chdir("/tmp")
-  data_model = ModelDownloader(args.url_model, args.url_dataset)
-  data_model.download_model()
-  data_model.download_dataset()
-  print("Classes: ", data_model.classes) if debug else None
+  model_files = ModelDownloader(args.url_model, args.url_dataset)
+  model_files.download_model()
+  model_files.download_dataset()
+  print("Classes: ", model_files.classes) if debug else None
   
   # Directorio de imágenes y lista de imágenes
-  dir_images_path = data_model.gt_path
-  images_sample = sorted([img for ext in ["*.jpg", "*.jpeg", "*.png"] for img in dir_images_path.glob(ext)])
-  image_path = dir_images_path / Path("Avances-Elite-Toluquilla-II-a-julio-2024_mp4-0021.jpg") # Imagen especifica
-
-  onnx_model = onnx.load(open(data_model.model_path_onnx, "rb"))
+  onnx_model = onnx.load(open(model_files.model_path_onnx, "rb"))
   input_shapes = {inp.name:tuple(x.dim_value for x in inp.type.tensor_type.shape.dim) for inp in onnx_model.graph.input}
   target_size = tuple(reversed(input_shapes['images'][2:]))
 
   if not args.model_path_pkl:
-    args.model_path_pkl = data_model.model_path_onnx.parent / "best.pkl"
+    args.model_path_pkl = model_files.model_path_onnx.parent / "best.pkl"
   if not Path(args.model_path_pkl).is_file():
     print(f"El archivo '{args.model_path_pkl}' no existe.")
     
     print(f"Compilando...")
-    run_onnx_jit = compilar_modelo(onnx_model, data_model, images_sample, args.model_path_pkl)
+    run_onnx_jit = compilar_modelo(onnx_model, model_files, images_sample, args.model_path_pkl)
   else: 
       print(f"Abriendo modelo compilado en {args.model_path_pkl}")
       with open(args.model_path_pkl, "rb") as f:
@@ -375,7 +338,7 @@ if __name__ == "__main__":
     
     # Post-procesar la imagen con las detecciones
     timer.start()
-    postprocessed_image = postprocess_image(output_tensor, original_image, data_model)
+    postprocessed_image = postprocess_image(output_tensor, original_image, model_files)
     postinferencia_time = timer.stop()
     
     # Imprimir velocidad del modelo
