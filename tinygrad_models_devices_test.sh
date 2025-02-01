@@ -11,13 +11,9 @@ PYTHON_EXEC="tinygrad_env/bin/python"
 SCRIPT_PATH="examples/yolov8-onnx_jit.py"
 JIT_MODEL="models/yoloV8-Medium-NucleaV9/best.pkl"
 
-# Lista de modelos a descargar
-DEVICES=(
-    "QCOM"
-  	"GPU"
-  	"CLANG"
-  	"DSP"
-)
+# Extraer backends disponibles
+DEVICES_STR=$($PYTHON_EXEC -c "from tinygrad import Device; print(' '.join(Device.get_available_devices()))")
+read -ra DEVICES <<< "$DEVICES_STR"
 
 for DEVICE in "${DEVICES[@]}"; do
     echo "Ejecutando dispositivo: $DEVICE"
