@@ -16,14 +16,19 @@ DEVICES_STR=$($PYTHON_EXEC -c "from tinygrad import Device; print(' '.join(Devic
 read -ra DEVICES <<< "$DEVICES_STR"
 
 for DEVICE in "${DEVICES[@]}"; do
+	if [ -f "$JIT_MODEL" ]; then
+	    echo "Eliminando $JIT_MODEL para siguiente prueba"
+	    rm "$JIT_MODEL"
+	else
+	    echo "Advertencia: No se encontró $JIT_MODEL, saltando eliminación."
+	fi
     echo "Ejecutando dispositivo: $DEVICE"
     $PYTHON_EXEC $SCRIPT_PATH --device "$DEVICE" --imshow "False"
     if [ $? -ne 0 ]; then
         echo "Error ejecutando el modelo: $MODEL_URL"
         exit 1
     fi
-    echo "Eliminando $JIT_MODEL para siguiente prueba"
-    rm $JIT_MODEL
+    
 done
 
 echo "Todos los modelos han sido procesados correctamente."
