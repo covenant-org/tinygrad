@@ -32,6 +32,7 @@ os.environ.setdefault("JIT", "2")
 os.environ.setdefault("IMAGE", "1")
 os.environ.setdefault("FLOAT16", "1")
 os.environ.setdefault("DEFAULT_FLOAT", "HALF")
+os.environ.setdefault("PREREALIZE", "0")
 
 # os.environ.setdefault("CUDA", "1")
 # os.environ.setdefault("DEBUG", "4")
@@ -112,6 +113,7 @@ class ModelDownloader:
             print(f"Descomprimido en: {self.gt_path}")
             self.merge_folders(self.gt_path)
         self.get_yaml_data()
+        self.get_dataset_images()
         
     def get_yaml_data(self):
         self.yaml_path = self.gt_path / Path("data.yaml")
@@ -140,12 +142,13 @@ class ModelDownloader:
     def get_dataset_images(self):
       self.images_sample = sorted([img for ext in ["*.jpg", "*.jpeg", "*.png"] for img in self.gt_path.glob(ext)])
       # image_path = dir_images_path / Path("Avances-Elite-Toluquilla-II-a-julio-2024_mp4-0021.jpg") # Imagen especifica
-
+      return self.images_sample
 
 class ModelProcessor:
-    def __init__(self, model_files, debug=False):
+    def __init__(self, model_files, **kwargs):
         self.model_files = model_files
-        self.debug = debug
+        self.debug = kwargs.get("debug", False)
+        self.pkl_path = kwargs.get("pkl_path", "")
 
     def draw_bounding_box(self, img, class_id, confidence, x, y, x_plus_w, y_plus_h):
         label = f'{self.model_files.classes[class_id]} ({confidence:.2f})'
@@ -153,8 +156,8 @@ class ModelProcessor:
         cv2.rectangle(img, (x, y), (x_plus_w, y_plus_h), color, 2)
         cv2.putText(img, label, (x - 10, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
-    def preprocess_image(self, image, target_size=(640, 480)):
-        resized_image = cv2.resize(image, target_size)
+    def preprocess_image(self, image):
+        resized_image = cv2.resize(image, self.target_size)
         normalized_image = resized_image.astype(np.float32) / 255.0
         chw_image = np.transpose(normalized_image, (2, 0, 1))
         batched_image = np.expand_dims(chw_image, axis=0)
@@ -236,18 +239,19 @@ class ModelProcessor:
         print(f"Post-Inferencia: fase 1: {fase1_timer}ms, fase 2: {fase2_timer}ms, fase 3: {fase3_timer}ms")
         return resized_image
 
-    def compile_model(self, onnx_model, images_sample, model_path_pkl):
-        Device.DEFAULT = getenv("DEVICE", "CPU")
+    def compile_model(self, images_sample):
+        # Device.DEFAULT = getenv("DEVICE", "CPU")
+        print("Pickle: ", self.pkl_path)
         print("Dispositivo:", Device.DEFAULT)
 
-        run_onnx = OnnxRunner(onnx_model)
+        run_onnx = OnnxRunner(self.onnx_model)
         run_onnx_jit = TinyJit(
             lambda **kwargs: next(iter(run_onnx({k: v.to(Device.DEFAULT) for k, v in kwargs.items()}).values())).cast('float32'),
             prune=True
         )
 
         input_types = {
-            inp.name: tensor_dtype_to_np_dtype(inp.type.tensor_type.elem_type) for inp in onnx_model.graph.input
+            inp.name: tensor_dtype_to_np_dtype(inp.type.tensor_type.elem_type) for inp in self.onnx_model.graph.input
         }
         input_types = {k: (np.float32 if v == np.float16 else v) for k, v in input_types.items()}
 
@@ -280,37 +284,44 @@ class ModelProcessor:
         kernel_count = sum(1 for ei in run_onnx_jit.captured.jit_cache if isinstance(ei.prg, CompiledRunner))
         print(f"Kernels compilados: {kernel_count}")
 
-        with open(model_path_pkl, "wb") as f:
+        with open(self.pkl_path, "wb") as f:
             pickle.dump(run_onnx_jit, f)
 
         print(f"Modelo ONNX: {os.path.getsize(self.model_files.model_path_onnx) / 1e6:.2f} MB")
-        print(f"Modelo PKL: {os.path.getsize(model_path_pkl) / 1e6:.2f} MB")
+        print(f"Modelo PKL: {os.path.getsize(self.pkl_path) / 1e6:.2f} MB")
         print("**** Compilación finalizada ****")
 
         return run_onnx_jit
+
+    def load_onnx(self, onnx_path):
+      self.onnx_model = onnx.load(open(onnx_path, "rb"))
+      self.input_shapes = {inp.name:tuple(x.dim_value for x in inp.type.tensor_type.shape.dim) for inp in self.onnx_model.graph.input}
+      self.target_size = tuple(reversed(self.input_shapes['images'][2:]))
 
 if __name__ == "__main__":
   os.chdir("/tmp")
   model_files = ModelDownloader(args.url_model, args.url_dataset)
   model_files.download_model()
   model_files.download_dataset()
-  print("Classes: ", model_files.classes) if debug else None
   
-  # Directorio de imágenes y lista de imágenes
-  onnx_model = onnx.load(open(model_files.model_path_onnx, "rb"))
-  input_shapes = {inp.name:tuple(x.dim_value for x in inp.type.tensor_type.shape.dim) for inp in onnx_model.graph.input}
-  target_size = tuple(reversed(input_shapes['images'][2:]))
+  tinygrad_model = ModelProcessor(model_files)
+  tinygrad_model.load_onnx(model_files.model_path_onnx)
+  
+  print("Classes: ", model_files.classes) if debug else None
 
   if not args.model_path_pkl:
-    args.model_path_pkl = model_files.model_path_onnx.parent / "best.pkl"
-  if not Path(args.model_path_pkl).is_file():
-    print(f"El archivo '{args.model_path_pkl}' no existe.")
+    tinygrad_model.pkl_path = model_files.model_path_onnx.parent / "best.pkl"
+    print(tinygrad_model.pkl_path)
+  else:
+    tinygrad_model.pkl_path = args.model_path_pkl
     
+  if not Path(tinygrad_model.pkl_path).is_file():
+    print(f"El archivo '{tinygrad_model.pkl_path}' no existe.")
     print(f"Compilando...")
-    run_onnx_jit = compilar_modelo(onnx_model, model_files, images_sample, args.model_path_pkl)
+    run_onnx_jit = tinygrad_model.compile_model(model_files.images_sample[:3])
   else: 
-      print(f"Abriendo modelo compilado en {args.model_path_pkl}")
-      with open(args.model_path_pkl, "rb") as f:
+      print(f"Abriendo modelo compilado en {tinygrad_model.pkl_path}")
+      with open(tinygrad_model.pkl_path, "rb") as f:
           run_onnx_jit = pickle.load(f)
     
   print(run_onnx_jit) if debug else None
@@ -319,14 +330,14 @@ if __name__ == "__main__":
   # images_sample = ["Avances-Elite-Toluquilla-II-a-julio-2024_mp4-0021.jpg"]
   timer = Timer()
   acum_time = []
-  for image_path in images_sample[:10]:
+  for image_path in model_files.images_sample[:10]:
     timer.start()
     original_image = cv2.imread(image_path)
     if original_image is None:
         raise FileNotFoundError("No se pudo cargar la imagen.")
     
     # Pre-procesar la imagen a inputs que espera en modelo tinyjit
-    model_input = preprocess_image(original_image, target_size=target_size)
+    model_input = tinygrad_model.preprocess_image(original_image)
     preinferencia_time = timer.stop()
     
     # Ejecutar la inferencia
@@ -338,7 +349,7 @@ if __name__ == "__main__":
     
     # Post-procesar la imagen con las detecciones
     timer.start()
-    postprocessed_image = postprocess_image(output_tensor, original_image, model_files)
+    postprocessed_image = tinygrad_model.postprocess_image(output_tensor, original_image)
     postinferencia_time = timer.stop()
     
     # Imprimir velocidad del modelo
