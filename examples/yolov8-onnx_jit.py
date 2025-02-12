@@ -52,6 +52,7 @@ parser.add_argument("--device", type=str, default="", help="Mostrar imágenes a 
 args = parser.parse_args()
 
 args.imshow = args.imshow.lower() in ["true", "1", "yes"]
+Device.DEFAULT = args.device
 
 # Usar los valores en el código
 print(f"URL del modelo: {args.url_model}")
