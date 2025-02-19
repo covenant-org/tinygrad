@@ -52,7 +52,8 @@ parser.add_argument("--device", type=str, default="", help="Mostrar imágenes a 
 args = parser.parse_args()
 
 args.imshow = args.imshow.lower() in ["true", "1", "yes"]
-Device.DEFAULT = args.device
+if args.device:
+    Device.DEFAULT = args.device
 
 # Usar los valores en el código
 print(f"URL del modelo: {args.url_model}")
@@ -150,6 +151,7 @@ class ModelProcessor:
         self.model_files = model_files
         self.debug = kwargs.get("debug", False)
         self.pkl_path = kwargs.get("pkl_path", "")
+        self.acum_time = []
 
     def draw_bounding_box(self, img, class_id, confidence, x, y, x_plus_w, y_plus_h):
         label = f'{self.model_files.classes[class_id]} ({confidence:.2f})'
@@ -171,6 +173,10 @@ class ModelProcessor:
 
         inputs = {k: Tensor(v, device="NPY").realize() for k, v in new_inputs_numpy.items()}
         return inputs
+    
+    def inference(self, model_input):
+        output_tensor = self.run_onnx_jit(**model_input) 
+        return output_tensor
 
     def postprocess_image(self, output_tensor, original_image):
         timer = Timer()
@@ -240,13 +246,39 @@ class ModelProcessor:
         print(f"Post-Inferencia: fase 1: {fase1_timer}ms, fase 2: {fase2_timer}ms, fase 3: {fase3_timer}ms")
         return resized_image
 
+    def predict(self, original_image):
+        timer = Timer()
+        timer.start()
+        # Pre-procesar la imagen a inputs que espera en modelo tinyjit
+        model_input = self.preprocess_image(original_image)
+        preinferencia_time = timer.stop()
+
+        # Ejecutar la inferencia
+        timer.start()
+        output_tensor = self.inference(model_input)
+        inferencia_time = timer.stop()
+
+        print("Raw tensor: ", output_tensor) if debug else None
+
+        # Post-procesar la imagen con las detecciones
+        timer.start()
+        postprocessed_image = self.postprocess_image(output_tensor, original_image)
+        postinferencia_time = timer.stop()
+        
+        print(f"Pre-inferencia: {preinferencia_time}ms, Inferencia: {inferencia_time}ms, Post-inferencia: {postinferencia_time}ms")
+    
+        total_time = preinferencia_time + inferencia_time + postinferencia_time
+        self.acum_time.append(total_time)
+        
+        return postprocessed_image
+
     def compile_model(self, images_sample):
         # Device.DEFAULT = getenv("DEVICE", "CPU")
         print("Pickle: ", self.pkl_path)
         print("Dispositivo:", Device.DEFAULT)
 
         run_onnx = OnnxRunner(self.onnx_model)
-        run_onnx_jit = TinyJit(
+        self.run_onnx_jit = TinyJit(
             lambda **kwargs: next(iter(run_onnx({k: v.to(Device.DEFAULT) for k, v in kwargs.items()}).values())).cast('float32'),
             prune=True
         )
@@ -262,19 +294,19 @@ class ModelProcessor:
             GlobalCounters.reset()
             print(f"Ejecutando prueba {i}")
 
-            image = cv2.imread(images_sample[i])
+            image = images_sample[i]
             if image is None:
                 raise ValueError("No se pudo cargar la imagen.")
 
             model_input = self.preprocess_image(image)
 
             with Context(DEBUG=2 if i == 2 else 1):
-                ret = run_onnx_jit(**model_input).numpy()
+                ret = self.run_onnx_jit(**model_input).numpy()
 
             if i == 1:
                 test_val = np.copy(ret)
 
-        print(f"Captured {len(run_onnx_jit.captured.jit_cache)} kernels")
+        print(f"Captured {len(self.run_onnx_jit.captured.jit_cache)} kernels")
 
         try:
             np.testing.assert_allclose(test_val, ret, rtol=1e-3, atol=1e-3)
@@ -282,92 +314,73 @@ class ModelProcessor:
         except AssertionError as e:
             print("Fallo en validación JIT:", e)
 
-        kernel_count = sum(1 for ei in run_onnx_jit.captured.jit_cache if isinstance(ei.prg, CompiledRunner))
+        kernel_count = sum(1 for ei in self.run_onnx_jit.captured.jit_cache if isinstance(ei.prg, CompiledRunner))
         print(f"Kernels compilados: {kernel_count}")
 
         with open(self.pkl_path, "wb") as f:
-            pickle.dump(run_onnx_jit, f)
+            pickle.dump(self.run_onnx_jit, f)
 
         print(f"Modelo ONNX: {os.path.getsize(self.model_files.model_path_onnx) / 1e6:.2f} MB")
         print(f"Modelo PKL: {os.path.getsize(self.pkl_path) / 1e6:.2f} MB")
         print("**** Compilación finalizada ****")
 
-        return run_onnx_jit
+        return self.run_onnx_jit
 
     def load_onnx(self, onnx_path):
-      self.onnx_model = onnx.load(open(onnx_path, "rb"))
-      self.input_shapes = {inp.name:tuple(x.dim_value for x in inp.type.tensor_type.shape.dim) for inp in self.onnx_model.graph.input}
-      self.target_size = tuple(reversed(self.input_shapes['images'][2:]))
+        self.onnx_path = Path(onnx_path)
+        self.onnx_model = onnx.load(open(onnx_path, "rb"))
+        self.input_shapes = {inp.name:tuple(x.dim_value for x in inp.type.tensor_type.shape.dim) for inp in self.onnx_model.graph.input}
+        self.target_size = tuple(reversed(self.input_shapes['images'][2:]))
+      
+    def load_pkl(self, pkl_path = '', images_sample = None):
+        if not pkl_path:
+            self.pkl_path = self.onnx_path.parent / "best.pkl"
+        else:
+            self.pkl_path = pkl_path
+
+        if not Path(self.pkl_path).is_file():
+            print(f"El archivo '{self.pkl_path}' no existe.")
+            print(f"Compilando...")
+            assert images_sample and len(images_sample)>=3, "Se esperaba un arreglo de 3 imágenes, pero no se proporcionó."
+            self.compile_model(images_sample)
+        else: 
+            print(f"Abriendo modelo compilado en {self.pkl_path}")
+            with open(self.pkl_path, "rb") as f:
+                self.run_onnx_jit = pickle.load(f)
+
+def main():
+    os.chdir("/tmp")
+    model_files = ModelDownloader(args.url_model, args.url_dataset)
+    model_files.download_model()
+    model_files.download_dataset()
+    
+    images_sample = [cv2.imread(img) for img in model_files.images_sample[:3]]
+
+    tinygrad_model = ModelProcessor(model_files)
+    tinygrad_model.load_onnx(model_files.model_path_onnx) 
+    tinygrad_model.load_pkl(args.model_path_pkl, images_sample)
+    
+    print("Classes: ", model_files.classes) if debug else None
+
+    for image_path in model_files.images_sample:
+        original_image = cv2.imread(image_path)
+        if original_image is None:
+            raise FileNotFoundError(f"No se pudo cargar la imagen \"{image_path}\".")
+
+        predict_image = tinygrad_model.predict(original_image)
+
+        # Mostrar la imagen con las detecciones
+        if args.imshow:
+            cv2.imshow("Tinygrad model", predict_image)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+    cv2.destroyAllWindows()
+    print(f"\tMedian: {np.median(tinygrad_model.acum_time)}ms")
+
+    # # Guardar o mostrar la imagen con las detecciones
+    # output_path = "output_image.jpg"
+    # cv2.imwrite(output_path, output_image)
+    # print(f"Imagen procesada guardada en: {output_path}")
 
 if __name__ == "__main__":
-  os.chdir("/tmp")
-  model_files = ModelDownloader(args.url_model, args.url_dataset)
-  model_files.download_model()
-  model_files.download_dataset()
-  
-  tinygrad_model = ModelProcessor(model_files)
-  tinygrad_model.load_onnx(model_files.model_path_onnx)
-  
-  print("Classes: ", model_files.classes) if debug else None
-
-  if not args.model_path_pkl:
-    tinygrad_model.pkl_path = model_files.model_path_onnx.parent / "best.pkl"
-    print(tinygrad_model.pkl_path)
-  else:
-    tinygrad_model.pkl_path = args.model_path_pkl
-    
-  if not Path(tinygrad_model.pkl_path).is_file():
-    print(f"El archivo '{tinygrad_model.pkl_path}' no existe.")
-    print(f"Compilando...")
-    run_onnx_jit = tinygrad_model.compile_model(model_files.images_sample[:3])
-  else: 
-      print(f"Abriendo modelo compilado en {tinygrad_model.pkl_path}")
-      with open(tinygrad_model.pkl_path, "rb") as f:
-          run_onnx_jit = pickle.load(f)
-    
-  print(run_onnx_jit) if debug else None
-  # exit()
-
-  # images_sample = ["Avances-Elite-Toluquilla-II-a-julio-2024_mp4-0021.jpg"]
-  timer = Timer()
-  acum_time = []
-  for image_path in model_files.images_sample[:10]:
-    timer.start()
-    original_image = cv2.imread(image_path)
-    if original_image is None:
-        raise FileNotFoundError("No se pudo cargar la imagen.")
-    
-    # Pre-procesar la imagen a inputs que espera en modelo tinyjit
-    model_input = tinygrad_model.preprocess_image(original_image)
-    preinferencia_time = timer.stop()
-    
-    # Ejecutar la inferencia
-    timer.start()
-    output_tensor = run_onnx_jit(**model_input)  
-    inferencia_time = timer.stop()
-    
-    print("Raw tensor: ", output_tensor) if debug else None
-    
-    # Post-procesar la imagen con las detecciones
-    timer.start()
-    postprocessed_image = tinygrad_model.postprocess_image(output_tensor, original_image)
-    postinferencia_time = timer.stop()
-    
-    # Imprimir velocidad del modelo
-    print(f"Pre-inferencia: {preinferencia_time}ms, Inferencia: {inferencia_time}ms, Post-inferencia: {postinferencia_time}ms")
-    
-    total_time = preinferencia_time + inferencia_time + postinferencia_time
-    acum_time.append(total_time)
-    
-    # Mostrar la imagen con las detecciones
-    if args.imshow:
-      cv2.imshow("Tinygrad model", postprocessed_image)
-      if cv2.waitKey(1) & 0xFF == ord('q'):
-          break
-  cv2.destroyAllWindows()
-  print(f"\tMedian: {np.median(acum_time)}ms")
-
-# # Guardar o mostrar la imagen con las detecciones
-# output_path = "output_image.jpg"
-# cv2.imwrite(output_path, output_image)
-# print(f"Imagen procesada guardada en: {output_path}")
+  main()
